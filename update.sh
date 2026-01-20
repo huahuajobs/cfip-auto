@@ -1,6 +1,6 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v8.0 (HTTP直连终极版)
-# 核心逻辑：代理下载 -> 直连测速 -> 直连HTTP识COLO -> 代理推送
+# Cloudflare 优选 IP 自动化脚本 v8.1
+# 修复：Git 推送跟随系统代理，取消强制指定端口；增加重试次数
 
 set -uo pipefail
 
@@ -59,10 +59,11 @@ cleanup_env() {
 
 # 1. 代理模式下载
 fetch_ip_sources() {
-    log_info "第1步: 下载 IP 源 (代理模式)..."
+    log_info "第1步: 下载 IP 源..."
     > raw_input.txt
     for url in "${IP_SOURCES[@]}"; do
         log_info "  获取: $url"
+        # 使用系统默认代理 (同 curl 默认行为)
         curl -sL --connect-timeout 8 -m 20 "$url" >> raw_input.txt 2>/dev/null && log_ok "  ✓ 成功" || log_warn "  ✗ 失败"
     done
     
@@ -77,64 +78,56 @@ test_and_identify() {
     log_info "第2步: 直连测速 & 识别 (HTTP模式)..."
     [ ! -x "$CFST_BIN" ] && { log_error "CloudflareST 不存在"; exit 1; }
     
-    # 启用直连
     log_info "  > 启用直连规则"
     nft insert rule inet fw4 openclash_mangle_output counter return comment "CFIP_DIRECT" 2>/dev/null
     sleep 2
     
-    # A. 测速 (-dd 禁用下载测速, 仅 TCPing)
     log_info "  正在测速..."
     $CFST_BIN -f input.txt -tl "$LATENCY_LIMIT" -dd -dn 1000 -o tested.csv 2>&1 | tee -a "$LOG_FILE"
     
-    # B. 识别 COLO (HTTP)
     log_info "  正在识别 COLO (HTTP 直连)..."
     > "$OUTPUT_FILE"
     
     if [ -s tested.csv ]; then
-        # 提取 IP
         tail -n +2 tested.csv | cut -d',' -f1 | grep -E '^[0-9]' > passed_ips.txt
         local total=$(wc -l < passed_ips.txt)
         local current=0 success=0
         
         while IFS= read -r ip; do
             ((current++))
-            # 关键：使用 HTTP (80) 获取 COLO，避开 HTTPS 阻断
             colo=$(curl -s --connect-timeout 2 -m 3 "http://$ip/cdn-cgi/trace" | grep "colo=" | cut -d= -f2)
             
             if [ -n "$colo" ]; then
                 cn_name="${COLO_MAP[$colo]:-$colo}"
                 echo "${ip}#${cn_name}" >> "$OUTPUT_FILE"
                 ((success++))
-                # log_info "  [$current/$total] $ip -> $colo"
             else
                 echo "${ip}#UNKNOWN" >> "$OUTPUT_FILE"
-                # log_warn "  [$current/$total] $ip -> UNKNOWN"
             fi
             
-            # 进度条
             [ $((current % 10)) -eq 0 ] && echo -ne "  进度: $current/$total (成功: $success)\r"
             
         done < passed_ips.txt
-        echo "" # 换行
+        echo ""
         log_info "识别完成: $success/$total"
     else
         log_error "没有 IP 通过延迟测试"
     fi
 
-    # 关闭直连
     log_info "  < 恢复代理模式"
     handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
     [ -n "$handle" ] && nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
 }
 
-# 3. 推送 (强制代理)
+# 3. 推送 (跟随系统代理)
 git_push() {
     [ ! -s "$OUTPUT_FILE" ] && return 0
     log_info "第3步: Git 推送..."
     
-    # 强制配置 Git 代理 (解决卡死)
-    git config --local http.proxy "http://127.0.0.1:7890"
-    git config --local https.proxy "http://127.0.0.1:7890"
+    # 清除本地可能错误的代理配置，让 Git 使用系统环境变量
+    git config --local --unset http.proxy 2>/dev/null || true
+    git config --local --unset https.proxy 2>/dev/null || true
+    
     git config --local user.email "$GIT_EMAIL"
     git config --local user.name "$GIT_NAME"
     
@@ -142,17 +135,22 @@ git_push() {
     git diff --cached --quiet && { log_info "无变化，跳过"; return 0; }
     git commit -m "更新优选 IP - $(date '+%Y-%m-%d %H:%M')"
     
-    for i in 1 2 3; do
-        git push origin main 2>&1 >/dev/null && { log_ok "推送成功"; return 0; }
-        log_warn "重试推送 $i..."
+    # 重试 10 次
+    for i in {1..10}; do
+        # 尝试推送。如果失败，输出错误并重试
+        if git push origin main 2>&1; then
+            log_ok "推送成功"
+            return 0
+        fi
+        log_warn "推送失败，5秒后重试 ($i/10)..."
         sleep 5
     done
-    log_error "推送失败"
+    log_error "推送最终失败，请检查网络或 Git 配置"
 }
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v8.0 HTTP直连版 =========="
+    log_info "========== v8.1 系统代理版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
