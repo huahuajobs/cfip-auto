@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v2.2
+# Cloudflare 优选 IP 自动化脚本 v3.3
 
 set -uo pipefail
 
@@ -27,17 +27,25 @@ IP_SOURCES=(
     "https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/ips.txt"
 )
 
-# 城市中文名映射
+declare -A COLO_MAP=(
+    ["SJC"]="圣何塞" ["LAX"]="洛杉矶" ["SEA"]="西雅图"
+    ["ORD"]="芝加哥" ["DFW"]="达拉斯" ["IAD"]="华盛顿"
+    ["MIA"]="迈阿密" ["ATL"]="亚特兰大" ["JFK"]="纽约"
+    ["EWR"]="纽瓦克" ["BOS"]="波士顿" ["DEN"]="丹佛"
+    ["PHX"]="凤凰城" ["SLC"]="盐湖城" ["PDX"]="波特兰"
+    ["YYZ"]="多伦多" ["YVR"]="温哥华" ["YUL"]="蒙特利尔"
+    ["LHR"]="伦敦" ["FRA"]="法兰克福" ["AMS"]="阿姆斯特丹"
+    ["CDG"]="巴黎" ["MAD"]="马德里" ["MXP"]="米兰"
+    ["NRT"]="东京" ["KIX"]="大阪" ["ICN"]="首尔"
+    ["SIN"]="新加坡" ["HKG"]="香港" ["TPE"]="台北"
+    ["SYD"]="悉尼" ["MEL"]="墨尔本" ["BOM"]="孟买"
+)
+
 declare -A CITY_MAP=(
-    ["Toronto"]="多伦多" ["Los Angeles"]="洛杉矶" ["San Jose"]="圣何塞"
-    ["Seattle"]="西雅图" ["Chicago"]="芝加哥" ["Dallas"]="达拉斯"
-    ["Miami"]="迈阿密" ["Atlanta"]="亚特兰大" ["New York"]="纽约"
-    ["Washington"]="华盛顿" ["Vancouver"]="温哥华"
-    ["London"]="伦敦" ["Frankfurt"]="法兰克福" ["Amsterdam"]="阿姆斯特丹"
-    ["Paris"]="巴黎" ["Madrid"]="马德里"
-    ["Tokyo"]="东京" ["Seoul"]="首尔" ["Singapore"]="新加坡"
-    ["Hong Kong"]="香港" ["Taipei"]="台北" ["Sydney"]="悉尼"
-    ["San Francisco"]="旧金山" ["Phoenix"]="凤凰城" ["Denver"]="丹佛"
+    ["Hong Kong"]="香港" ["Tokyo"]="东京" ["Singapore"]="新加坡"
+    ["Seoul"]="首尔" ["Taipei"]="台北" ["Los Angeles"]="洛杉矶"
+    ["San Jose"]="圣何塞" ["Seattle"]="西雅图" ["New York"]="纽约"
+    ["London"]="伦敦" ["Frankfurt"]="法兰克福" ["Sydney"]="悉尼"
 )
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${@:2}" | tee -a "$LOG_FILE"; }
@@ -45,6 +53,23 @@ log_info() { log "INFO" "$@"; }
 log_warn() { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
 log_ok() { log "OK" "$@"; }
+
+enable_direct() {
+    log_info "启用直连模式..."
+    nft insert rule inet fw4 openclash_mangle_output counter return 2>/dev/null || true
+    nft insert rule inet fw4 openclash_mangle counter return 2>/dev/null || true
+    sleep 1
+}
+
+disable_direct() {
+    log_info "恢复代理模式..."
+    for chain in openclash_mangle_output openclash_mangle; do
+        handle=$(nft -a list chain inet fw4 $chain 2>/dev/null | grep "counter packets" | grep "return" | head -1 | grep -oE 'handle [0-9]+' | awk '{print $2}')
+        [ -n "$handle" ] && nft delete rule inet fw4 $chain handle $handle 2>/dev/null || true
+    done
+}
+
+trap disable_direct EXIT
 
 fetch_ip_sources() {
     log_info "开始获取 IP 源..."
@@ -89,13 +114,31 @@ test_latency() {
     fi
 }
 
-# 使用 ip-api.com 获取城市
-get_city() {
-    local ip=$1
-    local city=""
-    city=$(curl -s --connect-timeout 3 -m 5 "http://ip-api.com/json/${ip}?fields=city" 2>/dev/null | \
-           grep -oE '"city":"[^"]+"' | cut -d'"' -f4)
-    echo "${city:-UNKNOWN}"
+# 混合方案：先 CF trace，失败用 ip-api
+get_location() {
+    local ip=$1 colo="" city=""
+    
+    # 方法1: CF trace
+    colo=$(curl -s --connect-timeout 2 -m 3 -k \
+           --resolve "speed.cloudflare.com:443:$ip" \
+           "https://speed.cloudflare.com/cdn-cgi/trace" 2>/dev/null \
+           | grep -oE 'colo=[A-Z]+' | cut -d= -f2)
+    
+    if [ -n "$colo" ]; then
+        echo "${COLO_MAP[$colo]:-$colo}"
+        return
+    fi
+    
+    # 方法2: ip-api.com
+    city=$(curl -s --connect-timeout 2 -m 3 "http://ip-api.com/json/${ip}?fields=city" 2>/dev/null \
+           | grep -oE '"city":"[^"]+"' | cut -d'"' -f4)
+    
+    if [ -n "$city" ]; then
+        echo "${CITY_MAP[$city]:-$city}"
+        return
+    fi
+    
+    echo "UNKNOWN"
 }
 
 identify_locations() {
@@ -104,19 +147,16 @@ identify_locations() {
     local total=$(wc -l < passed_ips.txt) current=0 success=0
     while IFS= read -r ip; do
         ((current++)) || true
-        local city=$(get_city "$ip")
-        local city_cn="${CITY_MAP[$city]:-$city}"
-        if [ "$city" != "UNKNOWN" ] && [ -n "$city" ]; then
-            echo "${ip}#${city_cn}" >> "$OUTPUT_FILE"
+        local loc=$(get_location "$ip")
+        if [ "$loc" != "UNKNOWN" ] && [ -n "$loc" ]; then
+            echo "${ip}#${loc}" >> "$OUTPUT_FILE"
             ((success++)) || true
-            log_info "  [$current/$total] $ip -> $city_cn"
+            log_info "  [$current/$total] $ip -> $loc"
         else
             log_warn "  [$current/$total] $ip -> UNKNOWN"
         fi
-        # ip-api.com 免费版限速：45次/分钟，添加延迟
-        sleep 1.5
     done < passed_ips.txt
-    log_info "地区识别完成: 成功 $success"
+    log_info "识别完成: 成功 $success"
 }
 
 git_push() {
@@ -142,12 +182,18 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || { log_error "无法进入 $WORK_DIR"; exit 1; }
-    log_info "========== 开始执行 =========="
+    log_info "========== 开始执行 v3.3 =========="
+    
     fetch_ip_sources
     clean_ips
+    
+    enable_direct
     test_latency
     identify_locations
+    disable_direct
+    
     git_push
+    
     log_ok "========== 执行完成 =========="
     log_info "结果: $(wc -l < "$OUTPUT_FILE") 个 IP"
 }
