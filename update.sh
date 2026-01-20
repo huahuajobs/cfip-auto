@@ -1,10 +1,11 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v9.2
+# Cloudflare 优选 IP 自动化脚本 v9.3
 # 特性：
 # 1. 准入双轨制：VIP 源宽松测速(保活)，普通源严格测速(优选)。
-# 2. 选拔一视同仁：进入候选池后，完全按延迟由低到高排序。
-#    - All.txt: 每个地区延迟最低 Top 10
-#    - 地区.txt: 每个地区延迟最低 Top 20
+# 2. 动态生成区：只生成实际存在的地区文件，不生成空文件。
+# 3. 选拔一视同仁：进入候选池后，完全按延迟由低到高排序。
+#    - All.txt: 汇总所有存在地区，每个地区延迟最低 Top 10
+#    - [地区].txt: 动态生成实际存在的地区文件 (如 JP.txt)，Top 20
 
 set -uo pipefail
 
@@ -17,6 +18,7 @@ GIT_EMAIL="cfip@router.local"
 GIT_NAME="CFIP Bot"
 
 # 地区映射 & 国家代码
+# 格式: ["COLO"]="中文名|国家代码"
 declare -A COLO_INFO=(
     ["HKG"]="香港|HK" ["NRT"]="日本东京|JP" ["KIX"]="日本大阪|JP" ["ICN"]="韩国首尔|KR"
     ["SIN"]="新加坡|SG" ["TPE"]="台湾台北|TW" ["KHH"]="台湾高雄|TW" ["BKK"]="泰国曼谷|TH"
@@ -85,12 +87,12 @@ test_and_identify() {
     nft insert rule inet fw4 openclash_mangle_output counter return comment "CFIP_DIRECT" 2>/dev/null
     sleep 2
     
-    # VIP 宽松测速 (进池门槛低)
+    # VIP 宽松测速
     if [ -s vip_input.txt ]; then
         log_info "  测速 VIP (TL: 9999)..."
         $CFST_BIN -f vip_input.txt -tl 9999 -dd -dn 0 -o tested_vip.csv 2>&1 >/dev/null
     fi
-    # 普通严格测速 (进池门槛高)
+    # 普通严格测速
     if [ -s normal_input.txt ]; then
         log_info "  测速 普通 (TL: $LATENCY_LIMIT)..."
         $CFST_BIN -f normal_input.txt -tl "$LATENCY_LIMIT" -dd -dn 1000 -o tested_normal.csv 2>&1 >/dev/null
@@ -101,7 +103,6 @@ test_and_identify() {
     > merged.csv
     [ -s tested_vip.csv ] && tail -n +2 tested_vip.csv >> merged.csv
     [ -s tested_normal.csv ] && tail -n +2 tested_normal.csv >> merged.csv
-    # 去重
     sort -u -t, -k1,1 merged.csv -o merged.csv
     
     total=$(wc -l < merged.csv)
@@ -126,7 +127,6 @@ test_and_identify() {
             fi
         fi
         
-        # 写入: IP|Ping|CN_Name|CountryCode
         echo "$ip|$ping|$cn_name|$country" >> raw_data.txt
         
         [ $((current % 10)) -eq 0 ] && echo -ne "  进度: $current/$total\r"
@@ -137,23 +137,32 @@ test_and_identify() {
     handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
     [ -n "$handle" ] && nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
 
-    # C. 生成分类文件 (完全延迟导向)
-    log_info "  生成 地区.txt (Top20) 和 All.txt (Top10)..."
+    # C. 动态生成分类文件
+    log_info "  动态生成地区文件 (Top20)..."
     > All.txt
     
-    # 地区列表
-    COUNTRIES=("HK" "JP" "KR" "SG" "TW" "TH" "AU" "US" "DE" "UK" "FR" "NL" "ES")
+    # scan for existing country codes
+    EXISTING_CODES=$(cut -d'|' -f4 raw_data.txt | grep -vE "UNKNOWN|OTHER" | sort -u)
     
-    for code in "${COUNTRIES[@]}"; do
-        # 纯延迟排序，Top 20 -> 地区文件
-        grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 20 | awk -F"|" '{print $1"#" $3}' > "${code}.txt"
+    if [ -n "$EXISTING_CODES" ]; then
+        echo "识别到的地区: $EXISTING_CODES" | tr '\n' ' '
+        echo ""
         
-        # 纯延迟排序，Top 10 -> All.txt
-        grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 10 | awk -F"|" '{print $1"#" $3}' >> All.txt
-    done
+        for code in $EXISTING_CODES; do
+            # 生成地区文件: 纯 Ping 排序, 取前 20
+            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 20 | awk -F"|" '{print $1"#" $3}' > "${code}.txt"
+            
+            # 追加到 All.txt: 纯 Ping 排序, 取前 10
+            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 10 | awk -F"|" '{print $1"#" $3}' >> All.txt
+            
+            count=$(wc -l < "${code}.txt")
+            log_info "    - ${code}.txt: $count 个"
+        done
+    fi
     
-    # 清理
     rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt
+    
+    # 删除空文件
     find . -maxdepth 1 -name "*.txt" -size 0 -delete
 }
 
@@ -163,15 +172,14 @@ git_push() {
     git config --local --unset https.proxy 2>/dev/null || true
     git config --local user.email "$GIT_EMAIL"
     git config --local user.name "$GIT_NAME"
-    
-    # 确保没有 vip.txt
+
     rm -f vip.txt
     
     git add -A
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v9.2: 纯延迟排序版 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v9.3: 动态地区+纯延迟 - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -186,13 +194,12 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v9.2 纯延迟排序版 =========="
+    log_info "========== v9.3 动态纯延迟版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
     git_push
     log_ok "========== 全部完成 =========="
-    log_info "文件已生成: All.txt 及各地区文件"
 }
 
 main "$@"
