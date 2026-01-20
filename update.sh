@@ -1,6 +1,6 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v7.1 (安全修复版)
-# 修复：使用 comment 标记精确管理规则，防止误删系统规则
+# Cloudflare 优选 IP 自动化脚本 v8.0 (HTTP直连终极版)
+# 核心逻辑：代理下载 -> 直连测速 -> 直连HTTP识COLO -> 代理推送
 
 set -uo pipefail
 
@@ -12,6 +12,16 @@ OUTPUT_FILE="result.txt"
 LOG_FILE="update.log"
 GIT_EMAIL="cfip@router.local"
 GIT_NAME="CFIP Bot"
+
+# 地区映射
+declare -A COLO_MAP=(
+    ["HKG"]="香港" ["NRT"]="日本东京" ["KIX"]="日本大阪" ["ICN"]="韩国首尔"
+    ["SIN"]="新加坡" ["TPE"]="台湾台北" ["KHH"]="台湾高雄" ["BKK"]="泰国曼谷"
+    ["SYD"]="澳大利亚悉尼" ["LAX"]="美国洛杉矶" ["SJC"]="美国圣何塞" ["SEA"]="美国西雅图"
+    ["IAD"]="美国华盛顿" ["ORD"]="美国芝加哥" ["DFW"]="美国达拉斯" ["ATL"]="美国亚特兰大"
+    ["MIA"]="美国迈阿密" ["EWR"]="美国纽瓦克" ["FRA"]="德国法兰克福" ["LHR"]="英国伦敦"
+    ["CDG"]="法国巴黎" ["AMS"]="荷兰阿姆斯特丹" ["MAD"]="西班牙马德里"
+)
 
 # IP 源
 IP_SOURCES=(
@@ -30,35 +40,24 @@ IP_SOURCES=(
     "https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/ips.txt"
 )
 
-# 地区映射
-declare -A COLO_MAP=(
-    ["HKG"]="香港" ["NRT"]="日本东京" ["KIX"]="日本大阪" ["ICN"]="韩国首尔"
-    ["SIN"]="新加坡" ["TPE"]="台湾台北" ["KHH"]="台湾高雄" ["BKK"]="泰国曼谷"
-    ["SYD"]="澳大利亚悉尼" ["LAX"]="美国洛杉矶" ["SJC"]="美国圣何塞" ["SEA"]="美国西雅图"
-    ["IAD"]="美国华盛顿" ["ORD"]="美国芝加哥" ["DFW"]="美国达拉斯" ["ATL"]="美国亚特兰大"
-    ["MIA"]="美国迈阿密" ["EWR"]="美国纽瓦克" ["FRA"]="德国法兰克福" ["LHR"]="英国伦敦"
-    ["CDG"]="法国巴黎" ["AMS"]="荷兰阿姆斯特丹" ["MAD"]="西班牙马德里"
-)
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${@:2}" | tee -a "$LOG_FILE"; }
 log_info() { log "INFO" "$@"; }
 log_warn() { log "WARN" "$@"; }
 log_ok() { log "OK" "$@"; }
 log_error() { log "ERROR" "$@"; }
 
-# 0. 环境清理 (安全版)
+# 0. 环境清理
 cleanup_env() {
     log_info "初始化环境..."
-    # 精确匹配带有 CFIP_DIRECT 注释的规则
     while true; do
         handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
         [ -z "$handle" ] && break
-        log_warn "删除 CFIP 直连规则 handle: $handle"
+        log_warn "删除残留规则 handle: $handle"
         nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
     done
 }
 
-# 1. 代理模式下载 IP 源
+# 1. 代理模式下载
 fetch_ip_sources() {
     log_info "第1步: 下载 IP 源 (代理模式)..."
     > raw_input.txt
@@ -70,91 +69,82 @@ fetch_ip_sources() {
     grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' raw_input.txt | \
         awk -F. '$1>=1 && $1<=255 && $2<=255 && $3<=255 && $4<=255 && $1!~/^0/' | \
         sort -u > input.txt
-        
-    local count=$(wc -l < input.txt)
-    log_info "有效 IP 总数: $count"
-    [ "$count" -eq 0 ] && { log_error "没有有效 IP"; exit 1; }
+    log_info "有效 IP 总数: $(wc -l < input.txt)"
 }
 
-# 2. 直连模式测试真实延迟
-test_latency_real() {
-    log_info "第2步: 测试真实延迟 (直连模式)..."
+# 2. 直连模式测试 & 识别
+test_and_identify() {
+    log_info "第2步: 直连测速 & 识别 (HTTP模式)..."
     [ ! -x "$CFST_BIN" ] && { log_error "CloudflareST 不存在"; exit 1; }
     
-    # 启用直连规则 (带注释标记)
+    # 启用直连
     log_info "  > 启用直连规则"
     nft insert rule inet fw4 openclash_mangle_output counter return comment "CFIP_DIRECT" 2>/dev/null
     sleep 2
     
-    # -dd 禁用下载测速
+    # A. 测速 (-dd 禁用下载测速, 仅 TCPing)
+    log_info "  正在测速..."
     $CFST_BIN -f input.txt -tl "$LATENCY_LIMIT" -dd -dn 1000 -o tested.csv 2>&1 | tee -a "$LOG_FILE"
     
-    # 删除规则 (带注释标记)
+    # B. 识别 COLO (HTTP)
+    log_info "  正在识别 COLO (HTTP 直连)..."
+    > "$OUTPUT_FILE"
+    
+    if [ -s tested.csv ]; then
+        # 提取 IP
+        tail -n +2 tested.csv | cut -d',' -f1 | grep -E '^[0-9]' > passed_ips.txt
+        local total=$(wc -l < passed_ips.txt)
+        local current=0 success=0
+        
+        while IFS= read -r ip; do
+            ((current++))
+            # 关键：使用 HTTP (80) 获取 COLO，避开 HTTPS 阻断
+            colo=$(curl -s --connect-timeout 2 -m 3 "http://$ip/cdn-cgi/trace" | grep "colo=" | cut -d= -f2)
+            
+            if [ -n "$colo" ]; then
+                cn_name="${COLO_MAP[$colo]:-$colo}"
+                echo "${ip}#${cn_name}" >> "$OUTPUT_FILE"
+                ((success++))
+                # log_info "  [$current/$total] $ip -> $colo"
+            else
+                echo "${ip}#UNKNOWN" >> "$OUTPUT_FILE"
+                # log_warn "  [$current/$total] $ip -> UNKNOWN"
+            fi
+            
+            # 进度条
+            [ $((current % 10)) -eq 0 ] && echo -ne "  进度: $current/$total (成功: $success)\r"
+            
+        done < passed_ips.txt
+        echo "" # 换行
+        log_info "识别完成: $success/$total"
+    else
+        log_error "没有 IP 通过延迟测试"
+    fi
+
+    # 关闭直连
     log_info "  < 恢复代理模式"
     handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
     [ -n "$handle" ] && nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
-    sleep 2
-    
-    if [ -s tested.csv ]; then
-        tail -n +2 tested.csv | cut -d',' -f1 | grep -E '^[0-9]' > passed_ips.txt
-        local count=$(wc -l < passed_ips.txt)
-        log_info "真实延迟 <${LATENCY_LIMIT}ms IP: $count 个"
-        [ "$count" -eq 0 ] && { log_error "没有 IP 通过延迟测试"; exit 1; }
-    else
-        log_error "测试结果为空"
-        exit 1
-    fi
 }
 
-# 3. 代理模式识别 COLO
-identify_colo_proxy() {
-    log_info "第3步: 识别 COLO (代理反向筛选)..."
-    > "$OUTPUT_FILE"
-    local total_identified=0
-    cp passed_ips.txt remaining_ips.txt
-    
-    for colo in "${!COLO_MAP[@]}"; do
-        local cn_name="${COLO_MAP[$colo]}"
-        [ ! -s remaining_ips.txt ] && break
-        
-        temp_csv="temp_${colo}.csv"
-        $CFST_BIN -f remaining_ips.txt -httping -cfcolo "$colo" -tl 9999 -dd -dn 0 -o "$temp_csv" >/dev/null 2>&1
-        
-        if [ -s "$temp_csv" ]; then
-            local matched_ips=$(tail -n +2 "$temp_csv" | cut -d',' -f1 | grep -E '^[0-9]')
-            if [ -n "$matched_ips" ]; then
-                local num=$(echo "$matched_ips" | wc -l)
-                while IFS= read -r ip; do
-                    echo "${ip}#${cn_name}" >> "$OUTPUT_FILE"
-                done <<< "$matched_ips"
-                ((total_identified+=num))
-                grep -vFf <(echo "$matched_ips") remaining_ips.txt > remaining_ips.tmp && mv remaining_ips.tmp remaining_ips.txt
-            fi
-        fi
-        rm -f "$temp_csv"
-    done
-    
-    if [ -s remaining_ips.txt ]; then
-        local unknown_count=$(wc -l < remaining_ips.txt)
-        log_warn "  未识别地区: $unknown_count 个"
-        while IFS= read -r ip; do
-             echo "${ip}#UNKNOWN" >> "$OUTPUT_FILE"
-        done < remaining_ips.txt
-    fi
-    log_info "识别完成: 总计 $total_identified 个已知地区"
-}
-
-# 4. 推送
+# 3. 推送 (强制代理)
 git_push() {
     [ ! -s "$OUTPUT_FILE" ] && return 0
-    log_info "第4步: Git 推送..."
+    log_info "第3步: Git 推送..."
+    
+    # 强制配置 Git 代理 (解决卡死)
+    git config --local http.proxy "http://127.0.0.1:7890"
+    git config --local https.proxy "http://127.0.0.1:7890"
     git config --local user.email "$GIT_EMAIL"
     git config --local user.name "$GIT_NAME"
+    
     git add -A
     git diff --cached --quiet && { log_info "无变化，跳过"; return 0; }
     git commit -m "更新优选 IP - $(date '+%Y-%m-%d %H:%M')"
+    
     for i in 1 2 3; do
         git push origin main 2>&1 >/dev/null && { log_ok "推送成功"; return 0; }
+        log_warn "重试推送 $i..."
         sleep 5
     done
     log_error "推送失败"
@@ -162,14 +152,13 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== 开始执行 v7.1 (安全版) =========="
+    log_info "========== v8.0 HTTP直连版 =========="
     cleanup_env
     fetch_ip_sources
-    test_latency_real
-    identify_colo_proxy
+    test_and_identify
     git_push
-    log_ok "========== 全部完成 =========="
-    log_info "结果保存在: $OUTPUT_FILE ($(wc -l < "$OUTPUT_FILE") 行)"
+    log_ok "========== 完成 =========="
+    log_info "结果: $(wc -l < "$OUTPUT_FILE") 个"
 }
 
 main "$@"
