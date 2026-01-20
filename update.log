@@ -2260,3 +2260,46 @@ fatal: unable to access 'https://github.com/huahuajobs/cfip-auto.git/': TLS conn
 [2026-01-21 03:28:23] [INFO] 识别完成: 404/421
 [2026-01-21 03:28:23] [INFO]   < 恢复代理模式
 [2026-01-21 03:28:23] [INFO] 第3步: Git 推送...
+[2026-01-21 03:28:25] [OK] 推送成功
+[2026-01-21 03:28:25] [OK] ========== 完成 ==========
+[2026-01-21 03:28:25] [INFO] 结果: 421 个
+[2026-01-21 03:51:26] [INFO] ========== v8.3 VIP独立输出版 ==========
+[2026-01-21 03:51:26] [INFO] 初始化环境...
+[2026-01-21 03:51:26] [INFO] 第1步: 下载 IP 源...
+[2026-01-21 03:51:26] [INFO]   获取 VIP: https://ip.164746.xyz/ipTop10.html
+[2026-01-21 03:51:27] [OK]   ✓ 成功
+[2026-01-21 03:51:27] [INFO]   获取: https://raw.githubusercontent.com/chris202010/yxym/refs/heads/main/ip.txt
+[2026-01-21 03:51:27] [OK]   ✓ 成功
+[2026-01-21 03:51:27] [INFO]   获取: https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/All.txt
+[2026-01-21 03:51:28] [OK]   ✓ 成功
+[2026-01-21 03:51:28] [INFO]   获取: https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/JP.txt
+[2026-01-21 03:51:28] [OK]   ✓ 成功
+[2026-01-21 03:51:28] [INFO]   获取: https://raw.githubusercontent.com/gslege/CloudflareIP/refs/heads/main/country.txt
+[2026-01-21 03:51:28] [OK]   ✓ 成功
+[2026-01-21 03:51:28] [INFO]   获取: https://raw.githubusercontent.com/cys92096/cfipcaiji/refs/heads/main/ip.txt
+[2026-01-21 03:51:29] [OK]   ✓ 成功
+[2026-01-21 03:51:29] [INFO]   获取: https://raw.githubusercontent.com/Jackiegee857/yx777/refs/heads/main/speed_ip.txt
+[2026-01-21 03:51:29] [OK]   ✓ 成功
+[2026-01-21 03:51:29] [INFO]   获取: https://raw.githubusercontent.com/vipmc838/cf_best_ip/refs/heads/main/cloudflare_bestip.txt
+[2026-01-21 03:51:30] [OK]   ✓ 成功
+[2026-01-21 03:51:30] [INFO]   获取: https://raw.githubusercontent.com/946727185/auto-ip-update/refs/heads/main/%E4%BC%98%E9%80%89ip.txt
+[2026-01-21 03:51:30] [OK]   ✓ 成功
+[2026-01-21 03:51:30] [INFO]   获取: https://raw.githubusercontent.com/KafeMars/best-ips-domains/refs/heads/main/cf-bestips.txt
+[2026-01-21 03:51:31] [OK]   ✓ 成功
+[2026-01-21 03:51:31] [INFO]   获取: https://raw.githubusercontent.com/lu-lingyun/CloudflareST/refs/heads/main/TLS.txt
+[2026-01-21 03:51:31] [OK]   ✓ 成功
+[2026-01-21 03:51:31] [INFO]   获取: https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/jp.txt
+[2026-01-21 03:51:31] [OK]   ✓ 成功
+[2026-01-21 03:51:31] [INFO]   获取: https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/ips.txt
+[2026-01-21 03:51:32] [OK]   ✓ 成功
+[2026-01-21 03:51:32] [INFO] VIP IP: 10 | 普通 IP: 421
+[2026-01-21 03:51:32] [INFO] 第2步: 直连双轨测速 & 识别...
+[2026-01-21 03:51:32] [INFO]   > 启用直连规则
+[2026-01-21 03:51:34] [INFO]   验证 VIP IP (宽松模式)...
+[2026-01-21 03:51:34] [INFO]   筛选普通 IP (阈值: 200ms)...
+[2026-01-21 03:51:39] [INFO]   待识别 IP: 425 个
+[2026-01-21 03:51:39] [INFO]   正在识别 COLO (HTTP 直连)...
+[2026-01-21 03:53:46] [INFO] 识别完成: 410/425
+[2026-01-21 03:53:46] [INFO] VIP 专属结果: 10 个
+[2026-01-21 03:53:46] [INFO]   < 恢复代理模式
+[2026-01-21 03:53:46] [INFO] 第3步: Git 推送...
