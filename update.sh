@@ -1,5 +1,6 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v3.3
+# Cloudflare 优选 IP 自动化脚本 v5.0
+# 使用 cf-ray 响应头获取 COLO（代理模式可用）
 
 set -uo pipefail
 
@@ -28,48 +29,33 @@ IP_SOURCES=(
 )
 
 declare -A COLO_MAP=(
-    ["SJC"]="圣何塞" ["LAX"]="洛杉矶" ["SEA"]="西雅图"
-    ["ORD"]="芝加哥" ["DFW"]="达拉斯" ["IAD"]="华盛顿"
-    ["MIA"]="迈阿密" ["ATL"]="亚特兰大" ["JFK"]="纽约"
-    ["EWR"]="纽瓦克" ["BOS"]="波士顿" ["DEN"]="丹佛"
-    ["PHX"]="凤凰城" ["SLC"]="盐湖城" ["PDX"]="波特兰"
-    ["YYZ"]="多伦多" ["YVR"]="温哥华" ["YUL"]="蒙特利尔"
-    ["LHR"]="伦敦" ["FRA"]="法兰克福" ["AMS"]="阿姆斯特丹"
-    ["CDG"]="巴黎" ["MAD"]="马德里" ["MXP"]="米兰"
-    ["NRT"]="东京" ["KIX"]="大阪" ["ICN"]="首尔"
-    ["SIN"]="新加坡" ["HKG"]="香港" ["TPE"]="台北"
-    ["SYD"]="悉尼" ["MEL"]="墨尔本" ["BOM"]="孟买"
-)
-
-declare -A CITY_MAP=(
-    ["Hong Kong"]="香港" ["Tokyo"]="东京" ["Singapore"]="新加坡"
-    ["Seoul"]="首尔" ["Taipei"]="台北" ["Los Angeles"]="洛杉矶"
-    ["San Jose"]="圣何塞" ["Seattle"]="西雅图" ["New York"]="纽约"
-    ["London"]="伦敦" ["Frankfurt"]="法兰克福" ["Sydney"]="悉尼"
+    ["HKG"]="香港" ["NRT"]="日本东京" ["KIX"]="日本大阪" ["ICN"]="韩国首尔"
+    ["SIN"]="新加坡" ["TPE"]="台湾台北" ["LAX"]="美国洛杉矶" ["SJC"]="美国圣何塞"
+    ["SEA"]="美国西雅图" ["IAD"]="美国华盛顿" ["ORD"]="美国芝加哥" ["DFW"]="美国达拉斯"
+    ["FRA"]="德国法兰克福" ["LHR"]="英国伦敦" ["CDG"]="法国巴黎" ["AMS"]="荷兰阿姆斯特丹"
 )
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${@:2}" | tee -a "$LOG_FILE"; }
 log_info() { log "INFO" "$@"; }
 log_warn() { log "WARN" "$@"; }
-log_error() { log "ERROR" "$@"; }
 log_ok() { log "OK" "$@"; }
+log_error() { log "ERROR" "$@"; }
 
+DIRECT_HANDLE=""
 enable_direct() {
     log_info "启用直连模式..."
-    nft insert rule inet fw4 openclash_mangle_output counter return 2>/dev/null || true
-    nft insert rule inet fw4 openclash_mangle counter return 2>/dev/null || true
+    nft insert rule inet fw4 openclash_mangle_output counter return
     sleep 1
+    DIRECT_HANDLE=$(nft -a list chain inet fw4 openclash_mangle_output | head -5 | grep "counter packets" | grep " return$" | head -1 | grep -oE 'handle [0-9]+' | awk '{print $2}')
+    log_info "直连规则 handle: $DIRECT_HANDLE"
 }
 
 disable_direct() {
     log_info "恢复代理模式..."
-    for chain in openclash_mangle_output openclash_mangle; do
-        handle=$(nft -a list chain inet fw4 $chain 2>/dev/null | grep "counter packets" | grep "return" | head -1 | grep -oE 'handle [0-9]+' | awk '{print $2}')
-        [ -n "$handle" ] && nft delete rule inet fw4 $chain handle $handle 2>/dev/null || true
-    done
+    [ -n "$DIRECT_HANDLE" ] && nft delete rule inet fw4 openclash_mangle_output handle $DIRECT_HANDLE 2>/dev/null
+    sleep 2
+    log_ok "代理已恢复"
 }
-
-trap disable_direct EXIT
 
 fetch_ip_sources() {
     log_info "开始获取 IP 源..."
@@ -86,77 +72,44 @@ clean_ips() {
     grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' raw_input.txt | \
         awk -F. '$1>=1 && $1<=255 && $2<=255 && $3<=255 && $4<=255 && $1!~/^0/' | \
         sort -u > input.txt
-    local count=$(wc -l < input.txt)
-    log_info "清洗后有效 IP: $count 个"
-    if [ "$count" -eq 0 ]; then
-        log_error "没有有效 IP"
-        exit 1
-    fi
+    log_info "清洗后有效 IP: $(wc -l < input.txt) 个"
+    [ $(wc -l < input.txt) -eq 0 ] && { log_error "没有有效 IP"; exit 1; }
 }
 
 test_latency() {
-    log_info "开始延迟测试 (阈值: ${LATENCY_LIMIT}ms)..."
-    if [ ! -x "$CFST_BIN" ]; then
-        log_error "CloudflareST 不存在"
-        exit 1
-    fi
-    $CFST_BIN -f input.txt -dd -tl "$LATENCY_LIMIT" -dn 500 -o tested.csv 2>&1 | tee -a "$LOG_FILE"
-    if [ ! -s tested.csv ]; then
-        log_error "延迟测试失败"
-        exit 1
-    fi
+    log_info "开始延迟测试 (HTTPing, 阈值: ${LATENCY_LIMIT}ms)..."
+    [ ! -x "$CFST_BIN" ] && { log_error "CloudflareST 不存在"; exit 1; }
+    $CFST_BIN -f input.txt -httping -tl "$LATENCY_LIMIT" -dd -dn 500 -o tested.csv 2>&1 | tee -a "$LOG_FILE"
+    [ ! -s tested.csv ] && { log_error "延迟测试失败"; exit 1; }
     tail -n +2 tested.csv | cut -d',' -f1 | grep -E '^[0-9]' > passed_ips.txt || true
-    local count=$(wc -l < passed_ips.txt)
-    log_info "通过延迟测试: $count 个"
-    if [ "$count" -eq 0 ]; then
-        log_error "没有 IP 通过测试"
-        exit 1
-    fi
+    log_info "通过延迟测试: $(wc -l < passed_ips.txt) 个"
+    [ $(wc -l < passed_ips.txt) -eq 0 ] && { log_error "没有 IP 通过测试"; exit 1; }
 }
 
-# 混合方案：先 CF trace，失败用 ip-api
-get_location() {
-    local ip=$1 colo="" city=""
-    
-    # 方法1: CF trace
-    colo=$(curl -s --connect-timeout 2 -m 3 -k \
-           --resolve "speed.cloudflare.com:443:$ip" \
-           "https://speed.cloudflare.com/cdn-cgi/trace" 2>/dev/null \
-           | grep -oE 'colo=[A-Z]+' | cut -d= -f2)
-    
-    if [ -n "$colo" ]; then
-        echo "${COLO_MAP[$colo]:-$colo}"
-        return
-    fi
-    
-    # 方法2: ip-api.com
-    city=$(curl -s --connect-timeout 2 -m 3 "http://ip-api.com/json/${ip}?fields=city" 2>/dev/null \
-           | grep -oE '"city":"[^"]+"' | cut -d'"' -f4)
-    
-    if [ -n "$city" ]; then
-        echo "${CITY_MAP[$city]:-$city}"
-        return
-    fi
-    
-    echo "UNKNOWN"
+# 使用 cf-ray 响应头获取 COLO
+get_colo() {
+    local ip=$1
+    local colo=$(curl -sI --connect-timeout 2 -m 3 --resolve "cloudflare.com:443:$ip" "https://cloudflare.com" 2>/dev/null | grep -i "cf-ray" | grep -oE '[A-Z]{3}$')
+    echo "${colo:-UNKNOWN}"
 }
 
-identify_locations() {
-    log_info "开始识别地区..."
+identify_colo() {
+    log_info "开始识别 COLO (cf-ray 方式)..."
     > "$OUTPUT_FILE"
     local total=$(wc -l < passed_ips.txt) current=0 success=0
     while IFS= read -r ip; do
         ((current++)) || true
-        local loc=$(get_location "$ip")
-        if [ "$loc" != "UNKNOWN" ] && [ -n "$loc" ]; then
-            echo "${ip}#${loc}" >> "$OUTPUT_FILE"
+        local colo=$(get_colo "$ip")
+        if [ "$colo" != "UNKNOWN" ] && [ -n "$colo" ]; then
+            local cn_name="${COLO_MAP[$colo]:-$colo}"
+            echo "${ip}#${cn_name}" >> "$OUTPUT_FILE"
             ((success++)) || true
-            log_info "  [$current/$total] $ip -> $loc"
+            log_info "  [$current/$total] $ip -> $colo ($cn_name)"
         else
             log_warn "  [$current/$total] $ip -> UNKNOWN"
         fi
     done < passed_ips.txt
-    log_info "识别完成: 成功 $success"
+    log_info "COLO 识别完成: 成功 $success"
 }
 
 git_push() {
@@ -164,34 +117,27 @@ git_push() {
     git config --local user.email "$GIT_EMAIL"
     git config --local user.name "$GIT_NAME"
     git add -A
-    if git diff --cached --quiet; then
-        log_info "无变化，跳过推送"
-        return 0
-    fi
+    git diff --cached --quiet && { log_info "无变化，跳过推送"; return 0; }
     git commit -m "更新优选 IP - $(date '+%Y-%m-%d %H:%M')"
     for i in 1 2 3; do
-        if git push origin main 2>&1 | tee -a "$LOG_FILE"; then
-            log_ok "推送成功"
-            return 0
-        fi
+        git push origin main 2>&1 | tee -a "$LOG_FILE" && { log_ok "推送成功"; return 0; }
         log_warn "推送失败，重试 $i/3..."; sleep 5
     done
-    log_error "推送失败"
-    return 1
+    log_error "推送失败"; return 1
 }
 
 main() {
     cd "$WORK_DIR" || { log_error "无法进入 $WORK_DIR"; exit 1; }
-    log_info "========== 开始执行 v3.3 =========="
+    log_info "========== 开始执行 v5.0 =========="
     
     fetch_ip_sources
     clean_ips
     
     enable_direct
     test_latency
-    identify_locations
     disable_direct
     
+    identify_colo  # 代理模式下用 cf-ray 获取 COLO
     git_push
     
     log_ok "========== 执行完成 =========="
