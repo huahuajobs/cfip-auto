@@ -1,8 +1,10 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v9.7
+# Cloudflare 优选 IP 自动化脚本 v9.8
 # 特性：
 # 1. 准入双轨制 & 动态地区 & 纯延迟排序
-# 2. 优选域名双保险: HTTPS(-k) -> HTTP 回退机制
+# 2. 优选域名双轨制: 
+#    - 直连测速 (HTTPS->HTTP)
+#    - 失败保活: 直连失败不删除，转入代理模式识别 COLO (延迟记为 9999)
 # 3. 强制 IPv4: 避免直连模式下 IPv6 不稳导致超时
 # 4. 兼容性: 修复 BusyBox find 命令报错
 
@@ -125,6 +127,7 @@ test_and_identify() {
     # === B. 域名测速部分 ===
     log_info "  测速优选域名..."
     > domain_results.txt
+    > failed_domains.txt
     local d_total=${#CUSTOM_DOMAINS[@]}
     local d_curr=0
     
@@ -155,7 +158,9 @@ test_and_identify() {
             echo "$domain|$latency|$cn_name" >> domain_results.txt
             log_info "    $d_curr/$d_total: $domain ($latency ms) -> $cn_name"
         else
-            log_warn "    $d_curr/$d_total: $domain 连接失败 (超时/无响应)"
+            # 记录失败域名，稍后用代理回退识别
+            echo "$domain" >> failed_domains.txt
+            log_warn "    $d_curr/$d_total: $domain 直连失败 -> 稍后代理识别"
         fi
     done
     echo ""
@@ -198,7 +203,32 @@ test_and_identify() {
     handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
     [ -n "$handle" ] && nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
 
-    # === D. 生成文件 ===
+    # === D. 失败域名回退识别 (代理模式) ===
+    if [ -s failed_domains.txt ]; then
+        log_info "  正在通过代理识别直连失败的域名..."
+        while read -r domain; do
+            # 代理模式下尝试获取 COLO (不做强制 IPv4，让系统代理决定)
+            output=$(curl -k -s --connect-timeout 3 -m 5 "https://$domain/cdn-cgi/trace")
+            if [[ "$output" != *"colo="* ]]; then
+                 output=$(curl -s --connect-timeout 3 -m 5 "http://$domain/cdn-cgi/trace")
+            fi
+            
+            colo=$(echo "$output" | grep -o "colo=[A-Z]*" | cut -d= -f2)
+            cn_name="$colo"
+            if [ -n "$colo" ]; then
+                info="${COLO_INFO[$colo]:-}"
+                [ -n "$info" ] && cn_name="${info%|*} (代理)"
+            else
+                cn_name="无法连接"
+            fi
+            
+            # 失败域名强制延迟 9999
+            echo "$domain|9999|$cn_name" >> domain_results.txt
+            log_warn "    - $domain -> $cn_name (延迟: 9999)"
+        done < failed_domains.txt
+    fi
+
+    # === E. 生成文件 ===
     log_info "  生成分类文件..."
     > All.txt
     
@@ -223,7 +253,7 @@ test_and_identify() {
     fi
     
     # 清理
-    rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt domain_results.txt
+    rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt domain_results.txt failed_domains.txt
     # 删除空文件 (兼容 BusyBox)
     for f in *.txt; do
         [ -s "$f" ] || rm -f "$f"
@@ -243,7 +273,7 @@ git_push() {
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v9.7: 域名双轨测速 & IPv4强制 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v9.8: 域名失败保活 & 代理识别 - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -258,7 +288,7 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v9.7 双轨修复版 =========="
+    log_info "========== v9.8 保活增强版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
