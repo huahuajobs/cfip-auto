@@ -1,9 +1,10 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v9.6
+# Cloudflare 优选 IP 自动化脚本 v9.7
 # 特性：
 # 1. 准入双轨制 & 动态地区 & 纯延迟排序
-# 2. 优选域名: HTTPS 直连测速 (解决 301 问题)
-# 3. 兼容性: 修复 BusyBox find 命令报错
+# 2. 优选域名双保险: HTTPS(-k) -> HTTP 回退机制
+# 3. 强制 IPv4: 避免直连模式下 IPv6 不稳导致超时
+# 4. 兼容性: 修复 BusyBox find 命令报错
 
 set -uo pipefail
 
@@ -129,9 +130,15 @@ test_and_identify() {
     
     for domain in "${CUSTOM_DOMAINS[@]}"; do
         ((d_curr++))
-        # 修正: 使用 https 避免 301 跳转导致拿不到 colo
-        output=$(curl -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "https://$domain/cdn-cgi/trace")
+        # 1. 优先尝试 HTTPS (强制 IPv4, 忽略证书错误 -k)
+        output=$(curl -4 -k -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "https://$domain/cdn-cgi/trace")
         
+        # 2. 如果 HTTPS 失败，回退尝试 HTTP
+        if [[ "$output" != *"colo="* ]]; then
+             output=$(curl -4 -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "http://$domain/cdn-cgi/trace")
+        fi
+        
+        # 检查是否请求成功
         if [[ "$output" == *"colo="* ]]; then
             latency_sec=$(echo "$output" | tail -n1 | cut -d'|' -f2)
             latency=$(awk -v t="$latency_sec" 'BEGIN {printf "%d", t*1000}')
@@ -146,9 +153,9 @@ test_and_identify() {
             fi
             
             echo "$domain|$latency|$cn_name" >> domain_results.txt
-            echo -ne "    $d_curr/$d_total: $domain ($latency ms) -> $cn_name \r"
+            log_info "    $d_curr/$d_total: $domain ($latency ms) -> $cn_name"
         else
-            echo -ne "    $d_curr/$d_total: $domain (超时/失败) \r"
+            log_warn "    $d_curr/$d_total: $domain 连接失败 (超时/无响应)"
         fi
     done
     echo ""
@@ -236,7 +243,7 @@ git_push() {
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v9.6: 修复域名前缀及兼容性 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v9.7: 域名双轨测速 & IPv4强制 - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -251,7 +258,7 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v9.6 修复版 =========="
+    log_info "========== v9.7 双轨修复版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
