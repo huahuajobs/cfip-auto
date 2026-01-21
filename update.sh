@@ -1,10 +1,10 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v10.0 (纯净版)
+# Cloudflare 优选 IP 自动化脚本 v10.2
 # 特性：
 # 1. 准入双轨制: VIP(保活) + 普通(优选)
-# 2. 纯延迟排序: 所有 IP 进入候选池后，完全按 Ping 值排序
-# 3. 动态地区: 仅生成有有效 IP 的地区文件 (不生成空文件)
-# 4. 极致精简: 移除所有域名测速逻辑，专注于 IP 优选
+# 2. 纯延迟排序: 按 Ping 值排序
+# 3. 动态地区: 仅生成有有效 IP 的地区文件
+# 4. 格式优化: IP#地区|国家代码 (去除城市名)
 
 set -uo pipefail
 
@@ -16,14 +16,14 @@ LOG_FILE="update.log"
 GIT_EMAIL="cfip@router.local"
 GIT_NAME="CFIP Bot"
 
-# 地区映射
+# 地区映射 (仅保留国家/地区名)
 declare -A COLO_INFO=(
-    ["HKG"]="香港|HK" ["NRT"]="日本东京|JP" ["KIX"]="日本大阪|JP" ["ICN"]="韩国首尔|KR"
-    ["SIN"]="新加坡|SG" ["TPE"]="台湾台北|TW" ["KHH"]="台湾高雄|TW" ["BKK"]="泰国曼谷|TH"
-    ["SYD"]="澳大利亚悉尼|AU" ["LAX"]="美国洛杉矶|US" ["SJC"]="美国圣何塞|US" ["SEA"]="美国西雅图|US"
-    ["IAD"]="美国华盛顿|US" ["ORD"]="美国芝加哥|US" ["DFW"]="美国达拉斯|US" ["ATL"]="美国亚特兰大|US"
-    ["MIA"]="美国迈阿密|US" ["EWR"]="美国纽瓦克|US" ["FRA"]="德国法兰克福|DE" ["LHR"]="英国伦敦|UK"
-    ["CDG"]="法国巴黎|FR" ["AMS"]="荷兰阿姆斯特丹|NL" ["MAD"]="西班牙马德里|ES"
+    ["HKG"]="香港|HK" ["NRT"]="日本|JP" ["KIX"]="日本|JP" ["ICN"]="韩国|KR"
+    ["SIN"]="新加坡|SG" ["TPE"]="台湾|TW" ["KHH"]="台湾|TW" ["BKK"]="泰国|TH"
+    ["SYD"]="澳大利亚|AU" ["LAX"]="美国|US" ["SJC"]="美国|US" ["SEA"]="美国|US"
+    ["IAD"]="美国|US" ["ORD"]="美国|US" ["DFW"]="美国|US" ["ATL"]="美国|US"
+    ["MIA"]="美国|US" ["EWR"]="美国|US" ["FRA"]="德国|DE" ["LHR"]="英国|UK"
+    ["CDG"]="法国|FR" ["AMS"]="荷兰|NL" ["MAD"]="西班牙|ES"
 )
 
 # 1. VIP 源
@@ -144,11 +144,11 @@ test_and_identify() {
     EXISTING_CODES=$(cut -d'|' -f4 raw_data.txt | grep -vE "UNKNOWN|OTHER" | sort -u)
     if [ -n "$EXISTING_CODES" ]; then
         for code in $EXISTING_CODES; do
-            # 取 Top 20 保存为地区文件
-            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 20 | awk -F"|" '{print $1"#" $3}' > "${code}.txt"
+            # 取 Top 20 保存为地区文件 (格式: IP#地区|国家代码)
+            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 20 | awk -F"|" '{print $1"#" $3"|"$4}' > "${code}.txt"
             
             # 取 Top 10 加入 All.txt
-            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 10 | awk -F"|" '{print $1"#" $3}' >> All.txt
+            grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 10 | awk -F"|" '{print $1"#" $3"|"$4}' >> All.txt
             
             count=$(wc -l < "${code}.txt")
             log_info "    - ${code}.txt: $count 个"
@@ -177,7 +177,7 @@ git_push() {
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v10.0: 纯IP精简版 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v10.2: 格式优化(去城市) - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -192,7 +192,7 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v10.0 纯净 IP 版 =========="
+    log_info "========== v10.2 格式优化版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
