@@ -1,11 +1,10 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v9.3
+# Cloudflare 优选 IP 自动化脚本 v9.5
 # 特性：
-# 1. 准入双轨制：VIP 源宽松测速(保活)，普通源严格测速(优选)。
-# 2. 动态生成区：只生成实际存在的地区文件，不生成空文件。
-# 3. 选拔一视同仁：进入候选池后，完全按延迟由低到高排序。
-#    - All.txt: 汇总所有存在地区，每个地区延迟最低 Top 10
-#    - [地区].txt: 动态生成实际存在的地区文件 (如 JP.txt)，Top 20
+# 1. 准入双轨制 & 动态地区 & 纯延迟排序 (IP部分)
+# 2. 优选域名支持 (v9.5 新增):
+#    - 对指定域名列表进行直连测速与 COLO 识别
+#    - 独立输出到 "优选域名.txt"
 
 set -uo pipefail
 
@@ -17,8 +16,7 @@ LOG_FILE="update.log"
 GIT_EMAIL="cfip@router.local"
 GIT_NAME="CFIP Bot"
 
-# 地区映射 & 国家代码
-# 格式: ["COLO"]="中文名|国家代码"
+# 地区映射
 declare -A COLO_INFO=(
     ["HKG"]="香港|HK" ["NRT"]="日本东京|JP" ["KIX"]="日本大阪|JP" ["ICN"]="韩国首尔|KR"
     ["SIN"]="新加坡|SG" ["TPE"]="台湾台北|TW" ["KHH"]="台湾高雄|TW" ["BKK"]="泰国曼谷|TH"
@@ -45,6 +43,33 @@ NORMAL_SOURCES=(
     "https://raw.githubusercontent.com/lu-lingyun/CloudflareST/refs/heads/main/TLS.txt"
     "https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/jp.txt"
     "https://raw.githubusercontent.com/fangke1982/yx/refs/heads/main/ips.txt"
+    "https://cf.090227.xyz/ct?ips=6"
+    "https://cf.090227.xyz/ip.164746.xyz"
+)
+
+# 3. 优选域名列表 (不清洗格式，单独输出)
+CUSTOM_DOMAINS=(
+    "bestcf.030101.xyz"
+    "cdn.2020111.xyz"
+    "cdns.doon.eu.org"
+    "cf.0sm.com"
+    "cf.877771.xyz"
+    "cf.877774.xyz"
+    "cf.900501.xyz"
+    "cfip.1323123.xyz"
+    "cfip.cfcdn.vip"
+    "cfip.xxxxxxxx.tk"
+    "cloudflare.182682.xyz"
+    "cloudflare-dl.byoip.top"
+    "cloudflare-ip.mofashi.ltd"
+    "fn.130519.xyz"
+    "freeyx.cloudflare88.eu.org"
+    "nrt.xxxxxxxx.nyc.mn"
+    "nrtcfdns.zone.id"
+    "saas.sin.fan"
+    "tencentapp.cn"
+    "xn--b6gac.eu.org"
+    "777.ai7777777.xyz"
 )
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${@:2}" | tee -a "$LOG_FILE"; }
@@ -75,30 +100,67 @@ fetch_ip_sources() {
     }
     clean_file raw_vip.txt vip_input.txt
     clean_file raw_normal.txt normal_input.txt
-    log_info "VIP: $(wc -l < vip_input.txt) | 普通: $(wc -l < normal_input.txt)"
+    log_info "VIP IP: $(wc -l < vip_input.txt) | 普通 IP: $(wc -l < normal_input.txt)"
 }
 
 test_and_identify() {
-    log_info "第2步: 双轨测速 & 识别 & 竞价排序..."
+    log_info "第2步: 直连测速 & 识别 (IP + 域名)..."
     [ ! -x "$CFST_BIN" ] && { log_error "CloudflareST 不存在"; exit 1; }
     
-    # A. 直连测速
+    # 启用直连
     log_info "  > 启用直连规则"
     nft insert rule inet fw4 openclash_mangle_output counter return comment "CFIP_DIRECT" 2>/dev/null
     sleep 2
     
-    # VIP 宽松测速
+    # === A. IP 测速部分 ===
     if [ -s vip_input.txt ]; then
-        log_info "  测速 VIP (TL: 9999)..."
+        log_info "  测速 VIP IP (TL: 9999)..."
         $CFST_BIN -f vip_input.txt -tl 9999 -dd -dn 0 -o tested_vip.csv 2>&1 >/dev/null
     fi
-    # 普通严格测速
     if [ -s normal_input.txt ]; then
-        log_info "  测速 普通 (TL: $LATENCY_LIMIT)..."
+        log_info "  测速 普通 IP (TL: $LATENCY_LIMIT)..."
         $CFST_BIN -f normal_input.txt -tl "$LATENCY_LIMIT" -dd -dn 1000 -o tested_normal.csv 2>&1 >/dev/null
     fi
+    
+    # === B. 域名测速部分 ===
+    log_info "  测速优选域名..."
+    > domain_results.txt
+    local d_total=${#CUSTOM_DOMAINS[@]}
+    local d_curr=0
+    
+    for domain in "${CUSTOM_DOMAINS[@]}"; do
+        ((d_curr++))
+        # 使用 curl 测 TCP 连接时间 (直连)
+        # 格式: body|time_connect
+        output=$(curl -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "http://$domain/cdn-cgi/trace")
+        
+        # 检查是否请求成功
+        if [[ "$output" == *"colo="* ]]; then
+            # 提取最后的时间 (秒)
+            latency_sec=$(echo "$output" | tail -n1 | cut -d'|' -f2)
+            # 转毫秒 (x1000 取整)
+            latency=$(awk -v t="$latency_sec" 'BEGIN {printf "%d", t*1000}')
+            # 提取 COLO
+            colo=$(echo "$output" | grep -o "colo=[A-Z]*" | cut -d= -f2)
+            
+            # 识别中文名
+            cn_name="$colo"
+            if [ -n "$colo" ]; then
+                info="${COLO_INFO[$colo]:-}"
+                [ -n "$info" ] && cn_name="${info%|*}"
+            else
+                cn_name="UNKNOWN"
+            fi
+            
+            echo "$domain|$latency|$cn_name" >> domain_results.txt
+            echo -ne "    $d_curr/$d_total: $domain ($latency ms) -> $cn_name \r"
+        else
+            echo -ne "    $d_curr/$d_total: $domain (超时/失败) \r"
+        fi
+    done
+    echo ""
 
-    # B. 合并数据池
+    # === C. IP 识别与聚合 ===
     > raw_data.txt
     > merged.csv
     [ -s tested_vip.csv ] && tail -n +2 tested_vip.csv >> merged.csv
@@ -128,7 +190,6 @@ test_and_identify() {
         fi
         
         echo "$ip|$ping|$cn_name|$country" >> raw_data.txt
-        
         [ $((current % 10)) -eq 0 ] && echo -ne "  进度: $current/$total\r"
     done < merged.csv
     echo ""
@@ -137,32 +198,33 @@ test_and_identify() {
     handle=$(nft -a list chain inet fw4 openclash_mangle_output 2>/dev/null | grep 'comment "CFIP_DIRECT"' | head -1 | sed -n 's/.*handle \([0-9]*\).*/\1/p')
     [ -n "$handle" ] && nft delete rule inet fw4 openclash_mangle_output handle $handle 2>/dev/null
 
-    # C. 动态生成分类文件
-    log_info "  动态生成地区文件 (Top20)..."
+    # === D. 生成文件 ===
+    log_info "  生成分类文件..."
     > All.txt
     
-    # scan for existing country codes
+    # 1. IP 地区文件
     EXISTING_CODES=$(cut -d'|' -f4 raw_data.txt | grep -vE "UNKNOWN|OTHER" | sort -u)
-    
     if [ -n "$EXISTING_CODES" ]; then
-        echo "识别到的地区: $EXISTING_CODES" | tr '\n' ' '
-        echo ""
-        
         for code in $EXISTING_CODES; do
-            # 生成地区文件: 纯 Ping 排序, 取前 20
             grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 20 | awk -F"|" '{print $1"#" $3}' > "${code}.txt"
-            
-            # 追加到 All.txt: 纯 Ping 排序, 取前 10
             grep "|$code$" raw_data.txt | sort -t "|" -k2,2n | head -n 10 | awk -F"|" '{print $1"#" $3}' >> All.txt
-            
-            count=$(wc -l < "${code}.txt")
-            log_info "    - ${code}.txt: $count 个"
+            log_info "    - ${code}.txt"
         done
     fi
     
-    rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt
+    # 2. 优选域名.txt (单独输出)
+    if [ -s domain_results.txt ]; then
+        # 按延迟排序 -> 格式化输出: 域名#地区
+        sort -t "|" -k2,2n domain_results.txt | awk -F"|" '{print $1"#" $3}' > "优选域名.txt"
+        count=$(wc -l < "优选域名.txt")
+        log_info "    - 优选域名.txt: $count 个"
+    else
+        log_warn "    - 优选域名: 无可用结果"
+        > "优选域名.txt"
+    fi
     
-    # 删除空文件
+    # 清理
+    rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt domain_results.txt
     find . -maxdepth 1 -name "*.txt" -size 0 -delete
 }
 
@@ -179,7 +241,7 @@ git_push() {
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v9.3: 动态地区+纯延迟 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v9.5: 优选域名 - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -194,7 +256,7 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v9.3 动态纯延迟版 =========="
+    log_info "========== v9.5 优选域名版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
