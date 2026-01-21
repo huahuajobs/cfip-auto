@@ -1,10 +1,9 @@
 #!/bin/bash
-# Cloudflare 优选 IP 自动化脚本 v9.5
+# Cloudflare 优选 IP 自动化脚本 v9.6
 # 特性：
-# 1. 准入双轨制 & 动态地区 & 纯延迟排序 (IP部分)
-# 2. 优选域名支持 (v9.5 新增):
-#    - 对指定域名列表进行直连测速与 COLO 识别
-#    - 独立输出到 "优选域名.txt"
+# 1. 准入双轨制 & 动态地区 & 纯延迟排序
+# 2. 优选域名: HTTPS 直连测速 (解决 301 问题)
+# 3. 兼容性: 修复 BusyBox find 命令报错
 
 set -uo pipefail
 
@@ -47,7 +46,7 @@ NORMAL_SOURCES=(
     "https://cf.090227.xyz/ip.164746.xyz"
 )
 
-# 3. 优选域名列表 (不清洗格式，单独输出)
+# 3. 优选域名列表
 CUSTOM_DOMAINS=(
     "bestcf.030101.xyz"
     "cdn.2020111.xyz"
@@ -112,7 +111,7 @@ test_and_identify() {
     nft insert rule inet fw4 openclash_mangle_output counter return comment "CFIP_DIRECT" 2>/dev/null
     sleep 2
     
-    # === A. IP 测速部分 ===
+    # === A. IP 测速部份 ===
     if [ -s vip_input.txt ]; then
         log_info "  测速 VIP IP (TL: 9999)..."
         $CFST_BIN -f vip_input.txt -tl 9999 -dd -dn 0 -o tested_vip.csv 2>&1 >/dev/null
@@ -130,20 +129,14 @@ test_and_identify() {
     
     for domain in "${CUSTOM_DOMAINS[@]}"; do
         ((d_curr++))
-        # 使用 curl 测 TCP 连接时间 (直连)
-        # 格式: body|time_connect
-        output=$(curl -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "http://$domain/cdn-cgi/trace")
+        # 修正: 使用 https 避免 301 跳转导致拿不到 colo
+        output=$(curl -s --connect-timeout 2 -m 3 -w "|%{time_connect}" "https://$domain/cdn-cgi/trace")
         
-        # 检查是否请求成功
         if [[ "$output" == *"colo="* ]]; then
-            # 提取最后的时间 (秒)
             latency_sec=$(echo "$output" | tail -n1 | cut -d'|' -f2)
-            # 转毫秒 (x1000 取整)
             latency=$(awk -v t="$latency_sec" 'BEGIN {printf "%d", t*1000}')
-            # 提取 COLO
             colo=$(echo "$output" | grep -o "colo=[A-Z]*" | cut -d= -f2)
             
-            # 识别中文名
             cn_name="$colo"
             if [ -n "$colo" ]; then
                 info="${COLO_INFO[$colo]:-}"
@@ -214,7 +207,6 @@ test_and_identify() {
     
     # 2. 优选域名.txt (单独输出)
     if [ -s domain_results.txt ]; then
-        # 按延迟排序 -> 格式化输出: 域名#地区
         sort -t "|" -k2,2n domain_results.txt | awk -F"|" '{print $1"#" $3}' > "优选域名.txt"
         count=$(wc -l < "优选域名.txt")
         log_info "    - 优选域名.txt: $count 个"
@@ -225,7 +217,10 @@ test_and_identify() {
     
     # 清理
     rm -f raw_data.txt merged.csv tested_*.csv raw_*.txt *_input.txt passed_ips.txt vip.txt domain_results.txt
-    find . -maxdepth 1 -name "*.txt" -size 0 -delete
+    # 删除空文件 (兼容 BusyBox)
+    for f in *.txt; do
+        [ -s "$f" ] || rm -f "$f"
+    done
 }
 
 git_push() {
@@ -241,7 +236,7 @@ git_push() {
     if git diff --cached --quiet; then
         log_info "无变化，跳过"
     else
-        git commit -m "优选 v9.5: 优选域名 - $(date '+%Y-%m-%d %H:%M')"
+        git commit -m "优选 v9.6: 修复域名前缀及兼容性 - $(date '+%Y-%m-%d %H:%M')"
         for i in {1..10}; do
             if git push origin main 2>&1 >/dev/null; then
                 log_ok "推送成功"
@@ -256,7 +251,7 @@ git_push() {
 
 main() {
     cd "$WORK_DIR" || exit 1
-    log_info "========== v9.5 优选域名版 =========="
+    log_info "========== v9.6 修复版 =========="
     cleanup_env
     fetch_ip_sources
     test_and_identify
